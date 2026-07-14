@@ -51,6 +51,9 @@ initializeApp({
 
 const firestore = getFirestore();
 
+const ACCESS_TOKEN_SECRET = process.env.ACCESS_TOKEN_SECRET || "abcdefg";
+const REFRESH_TOKEN_SECRET = process.env.REFRESH_TOKEN_SECRET || "aabbccddeeffgg";
+
 // Helper function to auto-increment IDs in Firestore
 async function getNextId(collectionName) {
   const counterRef = firestore.collection('counters').doc(collectionName);
