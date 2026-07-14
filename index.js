@@ -738,11 +738,10 @@ app.post("/user/logout", (req, res) => {
 
 //keen
 
-// API สำหรับดึงรางวัลตามวันที่
+// API สำหรับดึงรางวัลตามวันที่ - FIXED FOR FIREBASE
 app.post("/lotto/prize", async (req, res) => {
   try {
     const { drawdate } = req.body;
-    log(drawdate);
     if (!drawdate) {
       return res.status(400).send({
         status: "error",
@@ -750,17 +749,32 @@ app.post("/lotto/prize", async (req, res) => {
       });
     }
 
-    const sqlStr = `
-      SELECT ln.number, wn.prize_amount, wn.prize_rank, wn.lotto_id
-      FROM winning_numbers wn
-      JOIN lotto_numbers ln ON wn.lotto_id = ln.lotto_id
-      WHERE DATE(ln.draw_date) = ?
-      ORDER BY wn.prize_rank ASC
-    `;
+    const winningsSnapshot = await firestore.collection('winning_numbers').get();
+    const results = [];
 
-    const result = await queryDatabase(sqlStr, [drawdate]);
+    const targetDate = drawdate.split('T')[0];
 
-    if (!result.data || result.data.length === 0) {
+    for (const doc of winningsSnapshot.docs) {
+      const winData = doc.data();
+      const lottoDoc = await firestore.collection('lotto_numbers').doc(String(winData.lotto_id)).get();
+      if (lottoDoc.exists) {
+        const lottoData = lottoDoc.data();
+        const lottoDrawDate = lottoData.draw_date ? lottoData.draw_date.split('T')[0] : "";
+
+        if (lottoDrawDate === targetDate) {
+          results.push({
+            number: lottoData.number,
+            prize_amount: winData.prize_amount,
+            prize_rank: winData.prize_rank,
+            lotto_id: winData.lotto_id
+          });
+        }
+      }
+    }
+
+    results.sort((a, b) => a.prize_rank - b.prize_rank);
+
+    if (results.length === 0) {
       return res.send({
         status: "success",
         message: "ไม่พบผลรางวัลสำหรับวันที่นี้",
@@ -771,7 +785,7 @@ app.post("/lotto/prize", async (req, res) => {
     res.send({
       status: "success",
       message: "",
-      data: result.data,
+      data: results,
     });
   } catch (error) {
     console.error(error);
@@ -782,7 +796,7 @@ app.post("/lotto/prize", async (req, res) => {
   }
 });
 
-// API สำหรับตรวจสอบรางวัล
+// API สำหรับตรวจสอบรางวัล - FIXED FOR FIREBASE
 app.post("/lotto/checkprize", async (req, res) => {
   try {
     const { number, drawdate, username } = req.body;
@@ -796,24 +810,47 @@ app.post("/lotto/checkprize", async (req, res) => {
       });
     }
 
-    // ตรวจสอบว่าผู้ใช้มีสลากนี้หรือไม่ (ในงวดที่ระบุ)
-    const purchaseSql = `
-      SELECT 
-        p.purchase_id,
-        ln.lotto_id,
-        ln.number,
-        p.status
-      FROM purchases p
-      JOIN users u ON p.user_id = u.user_id
-      JOIN lotto_numbers ln ON p.lotto_id = ln.lotto_id
-      WHERE u.username = ? 
-        AND ln.number like ?
-        AND DATE(ln.draw_date) = ?
-        AND p.status = 'purchased'
-    `;
-    const purchaseResult = await queryDatabase(purchaseSql, [username, number, drawdate]);
+    // 1. Find user by username
+    const userSnapshot = await firestore.collection('users').where('username', '==', username).get();
+    if (userSnapshot.empty) {
+      return res.send({
+        status: "error",
+        message: "ไม่พบผู้ใช้นี้ในระบบ",
+        data: [],
+      });
+    }
+    const userData = userSnapshot.docs[0].data();
+    const user_id = userData.user_id;
 
-    if (!purchaseResult.data || purchaseResult.data.length === 0) {
+    // 2. Find purchase history for this user
+    const purchasesSnapshot = await firestore.collection('purchases')
+      .where('user_id', '==', user_id)
+      .where('status', '==', 'purchased')
+      .get();
+
+    let userLotto = null;
+    const targetDate = drawdate.split('T')[0];
+
+    for (const pDoc of purchasesSnapshot.docs) {
+      const pData = pDoc.data();
+      const lottoDoc = await firestore.collection('lotto_numbers').doc(String(pData.lotto_id)).get();
+      if (lottoDoc.exists) {
+        const lottoData = lottoDoc.data();
+        const lottoDrawDate = lottoData.draw_date ? lottoData.draw_date.split('T')[0] : "";
+        
+        if (lottoDrawDate === targetDate && lottoData.number === number) {
+          userLotto = {
+            purchase_id: pData.purchase_id,
+            lotto_id: pData.lotto_id,
+            number: lottoData.number,
+            status: pData.status
+          };
+          break;
+        }
+      }
+    }
+
+    if (!userLotto) {
       return res.send({
         status: "error",
         message: "ไม่พบสลากใบนี้ในงวดที่ระบุ",
@@ -821,19 +858,12 @@ app.post("/lotto/checkprize", async (req, res) => {
       });
     }
 
-    const lottoId = purchaseResult.data[0].lotto_id;
-    log(lottoId.toString());
+    // 3. Check if it has winning prize
+    const winningsSnapshot = await firestore.collection('winning_numbers')
+      .where('lotto_id', '==', userLotto.lotto_id)
+      .get();
 
-    // ตรวจสอบว่าถูกรางวัลหรือไม่
-    const winningSql = `
-      SELECT ln.number, wn.prize_amount, wn.prize_rank ,wn.lotto_id
-      FROM winning_numbers wn JOIN lotto_numbers ln ON wn.lotto_id = ln.lotto_id
-      WHERE wn.lotto_id = ? and ln.status = 'sold'
-    `;
-
-    const winningResult = await queryDatabase(winningSql, [lottoId]);
-
-    if (!winningResult.data || winningResult.data.length === 0) {
+    if (winningsSnapshot.empty) {
       return res.send({
         status: "success",
         message: "ยังไม่ได้ถูกรางวัล",
@@ -841,14 +871,24 @@ app.post("/lotto/checkprize", async (req, res) => {
       });
     }
 
-    console.log("ยินดีด้วย ", lottoId);
+    const winningData = [];
+    for (const wDoc of winningsSnapshot.docs) {
+      const wData = wDoc.data();
+      winningData.push({
+        number: userLotto.number,
+        prize_amount: wData.prize_amount,
+        prize_rank: wData.prize_rank,
+        lotto_id: wData.lotto_id
+      });
+    }
+
+    console.log("ยินดีด้วย ", userLotto.lotto_id);
     return res.send({
       status: "success",
       message: "ยินดีด้วย! ถูกรางวัล",
-      data: winningResult.data,
+      data: winningData,
     });
   } catch (error) {
-    console.log("catch error");
     console.error("Error in checkprize:", error);
     res.status(500).send({
       status: "error",
