@@ -1,0 +1,5 @@
+node_modules/
+firebase-admin.json
+lotto.db
+.env
+*.log

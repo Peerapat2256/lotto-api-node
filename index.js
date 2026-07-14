@@ -22,44 +22,401 @@ Object.keys(ips).forEach(function (_interface) {
 });
 
 // =============== DATABASE CONNECTION POOL - OPTIMIZED ===============
-const db = mysql.createPool({
-  host: "202.28.34.203",
-  port: 3306,
-  user: "mb68_66011212249",
-  password: "O+Wjs1sL88ch",
-  database: "mb68_66011212249",
-  timezone: 'Z',
-  connectionLimit: 20,        // เพิ่มจาก 10 -> 20
-  queueLimit: 0,              // ไม่จำกัด queue
-  acquireTimeout: 30000,
-  timeout: 30000,
-  waitForConnections: true,   // รอ connection ว่างแทนที่จะ error
-  enableKeepAlive: true,
-  keepAliveInitialDelay: 0,
-  charset: 'utf8mb4'
+// =============== DATABASE CONNECTION POOL - FIREBASE ADAPTER ===============
+const { initializeApp, cert } = require('firebase-admin/app');
+const { getFirestore, Filter } = require('firebase-admin/firestore');
+const path = require('path');
+const fs = require('fs');
+
+let serviceAccount;
+const localKeyPath = path.join(__dirname, 'firebase-admin.json');
+if (fs.existsSync(localKeyPath)) {
+  serviceAccount = require('./firebase-admin.json');
+} else if (process.env.FIREBASE_CREDENTIALS) {
+  try {
+    serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS);
+  } catch (e) {
+    console.error("❌ Failed to parse FIREBASE_CREDENTIALS env variable as JSON", e);
+  }
+}
+
+if (!serviceAccount) {
+  console.error("❌ Firebase service account credentials not found! Place firebase-admin.json locally or set FIREBASE_CREDENTIALS environment variable.");
+  process.exit(1);
+}
+
+initializeApp({
+  credential: cert(serviceAccount)
 });
 
-// สร้าง promise wrapper สำหรับใช้ async/await
-const promisePool = db.promise();
+const firestore = getFirestore();
 
-const ACCESS_TOKEN_SECRET = "abcdefg";
-REFRESH_TOKEN_SECRET = "aabbccddeeffgg";
-
-// =============== TEST CONNECTION ===============
-promisePool.query("SELECT 1")
-  .then(() => {
-    console.log("✅ Database connected successfully!");
-  })
-  .catch((err) => {
-    console.error("❌ Database test error:", err);
+// Helper function to auto-increment IDs in Firestore
+async function getNextId(collectionName) {
+  const counterRef = firestore.collection('counters').doc(collectionName);
+  let nextId = 1;
+  await firestore.runTransaction(async (transaction) => {
+    const doc = await transaction.get(counterRef);
+    if (!doc.exists) {
+      transaction.set(counterRef, { count: 1 });
+      nextId = 1;
+    } else {
+      nextId = doc.data().count + 1;
+      transaction.update(counterRef, { count: nextId });
+    }
   });
+  return nextId;
+}
+
+// Helper to delete all documents in a collection (mock delete)
+async function deleteCollection(collectionName) {
+  const snapshot = await firestore.collection(collectionName).get();
+  const batch = firestore.batch();
+  snapshot.docs.forEach(doc => batch.delete(doc.ref));
+  await batch.commit();
+  await firestore.collection('counters').doc(collectionName).set({ count: 0 });
+}
+
+const db = {
+  query: function (sql, params, callback) {
+    let query = sql.trim();
+    let args = params || [];
+
+    if (typeof params === 'function') {
+      callback = params;
+      args = [];
+    }
+
+    (async () => {
+      try {
+        const uppercaseSql = query.toUpperCase();
+
+        // 1. Transaction helpers (mocked success)
+        if (uppercaseSql === 'START TRANSACTION' || uppercaseSql === 'BEGIN TRANSACTION' || uppercaseSql === 'COMMIT' || uppercaseSql === 'ROLLBACK') {
+          return callback(null, { affectedRows: 0 });
+        }
+
+        // 2. Clear table / Delete endpoints
+        if (uppercaseSql.startsWith('DELETE FROM')) {
+          if (uppercaseSql.includes('WINNING_NUMBERS')) {
+            await deleteCollection('winning_numbers');
+          } else if (uppercaseSql.includes('PURCHASES')) {
+            await deleteCollection('purchases');
+          } else if (uppercaseSql.includes('LOTTO_NUMBERS')) {
+            await deleteCollection('lotto_numbers');
+          } else if (uppercaseSql.includes('USERS')) {
+            // "DELETE FROM users WHERE username <> ?"
+            const snapshot = await firestore.collection('users').where('username', '!=', args[0]).get();
+            const batch = firestore.batch();
+            snapshot.docs.forEach(doc => batch.delete(doc.ref));
+            await batch.commit();
+          }
+          return callback(null, { affectedRows: 1 });
+        }
+
+        // 3. User email check
+        if (query.includes('SELECT email FROM users WHERE email=?')) {
+          const snapshot = await firestore.collection('users').where('email', '==', args[0]).get();
+          const rows = snapshot.docs.map(doc => doc.data());
+          return callback(null, rows);
+        }
+
+        // 4. User username check
+        if (query.includes('SELECT username FROM users WHERE username=?')) {
+          const snapshot = await firestore.collection('users').where('username', '==', args[0]).get();
+          const rows = snapshot.docs.map(doc => doc.data());
+          return callback(null, rows);
+        }
+
+        // 5. User registration
+        if (query.includes('INSERT into users (username, email,password,wallet,role)')) {
+          const user_id = await getNextId('users');
+          const newUser = {
+            user_id,
+            username: args[0],
+            email: args[1],
+            password: args[2],
+            wallet: Number(args[3]),
+            role: args[4]
+          };
+          await firestore.collection('users').doc(String(user_id)).set(newUser);
+          return callback(null, { insertId: user_id, affectedRows: 1 });
+        }
+
+        // 6. User login profile check (Logical OR query)
+        if (query.includes('SELECT * FROM users WHERE email=? or username=?') || 
+            query.includes('SELECT * FROM users WHERE email=? OR username=?')) {
+          const snapshot = await firestore.collection('users')
+            .where(Filter.or(
+              Filter.where('email', '==', args[0]),
+              Filter.where('username', '==', args[1])
+            )).get();
+          const rows = snapshot.docs.map(doc => doc.data());
+          return callback(null, rows);
+        }
+
+        // 7. Get profile by email
+        if (query.includes('SELECT user_id, username, email, wallet FROM users WHERE email=?')) {
+          const snapshot = await firestore.collection('users').where('email', '==', args[0]).get();
+          const rows = snapshot.docs.map(doc => doc.data());
+          return callback(null, rows);
+        }
+
+        // 8. Bulk insert lotto numbers
+        if (uppercaseSql.includes('INSERT INTO LOTTO_NUMBERS (NUMBER) VALUES ?') || 
+            uppercaseSql.includes('INSERT INTO LOTTO_NUMBERS(NUMBER) VALUES ?')) {
+          const lottoNumbers = args[0]; // [ ['123'], ['456'] ]
+          if (Array.isArray(lottoNumbers) && lottoNumbers.length > 0) {
+            const batch = firestore.batch();
+            const counterRef = firestore.collection('counters').doc('lotto_numbers');
+            let currentId = 0;
+            const doc = await counterRef.get();
+            if (doc.exists) currentId = doc.data().count;
+
+            const insertedIds = [];
+            for (let item of lottoNumbers) {
+              currentId++;
+              const lotto_id = currentId;
+              const num = Array.isArray(item) ? item[0] : item;
+              const newLotto = {
+                lotto_id,
+                number: num,
+                status: 'available',
+                draw_date: null,
+                user_id: null
+              };
+              batch.set(firestore.collection('lotto_numbers').doc(String(lotto_id)), newLotto);
+              insertedIds.push(lotto_id);
+            }
+            await batch.commit();
+            await counterRef.set({ count: currentId });
+            return callback(null, { insertId: insertedIds[0] || 0, affectedRows: lottoNumbers.length });
+          }
+        }
+
+        // 9. Select all lotto numbers
+        if (query.includes("SELECT number FROM lotto_numbers WHERE status='sold'")) {
+          const snapshot = await firestore.collection('lotto_numbers').where('status', '==', 'sold').get();
+          const rows = snapshot.docs.map(doc => ({ number: doc.data().number }));
+          return callback(null, rows);
+        }
+        if (query.includes("SELECT number FROM lotto_numbers")) {
+          const snapshot = await firestore.collection('lotto_numbers').get();
+          const rows = snapshot.docs.map(doc => ({ number: doc.data().number }));
+          return callback(null, rows);
+        }
+
+        // 10. Check if number exists and not drawn
+        if (query.includes('SELECT lotto_id FROM lotto_numbers WHERE number = ? AND (draw_date IS NULL OR draw_date = ?)')) {
+          const snapshot = await firestore.collection('lotto_numbers').where('number', '==', args[0]).get();
+          let rows = snapshot.docs.map(doc => doc.data());
+          if (args[1]) {
+            rows = rows.filter(d => !d.draw_date || d.draw_date === args[1]);
+          }
+          return callback(null, rows);
+        }
+
+        // 11. Find winning prize record
+        if (query.includes('SELECT id FROM winning_numbers WHERE lotto_id = ? AND prize_rank = ?')) {
+          const snapshot = await firestore.collection('winning_numbers')
+            .where('lotto_id', '==', args[0])
+            .where('prize_rank', '==', args[1]).get();
+          const rows = snapshot.docs.map(doc => doc.data());
+          return callback(null, rows);
+        }
+
+        // 12. Get available lotto tickets
+        if (query.includes("SELECT lotto_id, number, price, draw_date FROM lotto_numbers WHERE status = 'available'")) {
+          const snapshot = await firestore.collection('lotto_numbers').where('status', '==', 'available').get();
+          let rows = snapshot.docs.map(doc => {
+            const d = doc.data();
+            return {
+              lotto_id: d.lotto_id,
+              number: d.number,
+              price: d.price || 80,
+              draw_date: d.draw_date
+            };
+          });
+          if (args[0]) {
+            rows = rows.filter(r => !r.draw_date || r.draw_date === args[0]);
+          }
+          return callback(null, rows);
+        }
+
+        // 13. Select user id by email
+        if (query.includes('SELECT user_id FROM users WHERE email=?')) {
+          const snapshot = await firestore.collection('users').where('email', '==', args[0]).get();
+          const rows = snapshot.docs.map(doc => ({ user_id: doc.data().user_id }));
+          return callback(null, rows);
+        }
+
+        // 14. Check lotto status for purchase locking
+        if (query.includes("SELECT lotto_id FROM lotto_numbers WHERE lotto_id=? AND status='available'")) {
+          const doc = await firestore.collection('lotto_numbers').doc(String(args[0])).get();
+          if (doc.exists && doc.data().status === 'available') {
+            return callback(null, [{ lotto_id: doc.data().lotto_id }]);
+          }
+          return callback(null, []);
+        }
+
+        // 15. Check lotto status
+        if (query.includes("SELECT status FROM lotto_numbers WHERE lotto_id = ?")) {
+          const doc = await firestore.collection('lotto_numbers').doc(String(args[0])).get();
+          if (doc.exists) {
+            return callback(null, [{ status: doc.data().status }]);
+          }
+          return callback(null, []);
+        }
+
+        // 16. Get user wallet for payment check
+        if (query.includes('SELECT user_id, wallet FROM users WHERE email=?')) {
+          const snapshot = await firestore.collection('users').where('email', '==', args[0]).get();
+          const rows = snapshot.docs.map(doc => ({ user_id: doc.data().user_id, wallet: doc.data().wallet }));
+          return callback(null, rows);
+        }
+
+        // 17. Update wallet (deduction)
+        if (query.includes('UPDATE users SET wallet = wallet - ? WHERE user_id = ?')) {
+          const userRef = firestore.collection('users').doc(String(args[1]));
+          const doc = await userRef.get();
+          if (doc.exists) {
+            const currentWallet = doc.data().wallet || 0;
+            await userRef.update({ wallet: currentWallet - Number(args[0]) });
+          }
+          return callback(null, { affectedRows: 1 });
+        }
+
+        // 18. Update lotto ticket ownership to Sold
+        if (query.includes("UPDATE lotto_numbers SET status = 'sold', user_id = ? WHERE lotto_id = ?")) {
+          const lottoRef = firestore.collection('lotto_numbers').doc(String(args[1]));
+          await lottoRef.update({ status: 'sold', user_id: Number(args[0]) });
+          return callback(null, { affectedRows: 1 });
+        }
+
+        // 19. Record purchase ticket
+        if (query.includes('INSERT INTO purchases (user_id, lotto_id, status, purchase_date)')) {
+          const purchase_id = await getNextId('purchases');
+          const newPurchase = {
+            purchase_id,
+            user_id: Number(args[0]),
+            lotto_id: Number(args[1]),
+            status: 'pending',
+            purchase_date: new Date().toISOString()
+          };
+          await firestore.collection('purchases').doc(String(purchase_id)).set(newPurchase);
+          return callback(null, { insertId: purchase_id, affectedRows: 1 });
+        }
+
+        // 20. Update lotto draw date
+        if (query.includes('UPDATE lotto_numbers SET draw_date = ? WHERE lotto_id = ?')) {
+          await firestore.collection('lotto_numbers').doc(String(args[1])).update({ draw_date: args[0] });
+          return callback(null, { affectedRows: 1 });
+        }
+
+        // 21. Record winning number mapping
+        if (query.includes('INSERT INTO winning_numbers (prize_amount, prize_rank, lotto_id)')) {
+          const id = await getNextId('winning_numbers');
+          const newWinning = {
+            id,
+            prize_amount: Number(args[0]),
+            prize_rank: Number(args[1]),
+            lotto_id: Number(args[2])
+          };
+          await firestore.collection('winning_numbers').doc(String(id)).set(newWinning);
+          return callback(null, { insertId: id, affectedRows: 1 });
+        }
+
+        // 22. SELECT winning numbers JOIN lotto numbers
+        if (query.includes('FROM winning_numbers wn') && query.includes('JOIN lotto_numbers ln')) {
+          const winningsSnapshot = await firestore.collection('winning_numbers').get();
+          const results = [];
+          for (let doc of winningsSnapshot.docs) {
+            const winData = doc.data();
+            const lottoDoc = await firestore.collection('lotto_numbers').doc(String(winData.lotto_id)).get();
+            if (lottoDoc.exists) {
+              const lottoData = lottoDoc.data();
+              if (lottoData.draw_date === args[0]) {
+                results.push({
+                  number: lottoData.number,
+                  prize_amount: winData.prize_amount,
+                  prize_rank: winData.prize_rank,
+                  lotto_id: winData.lotto_id
+                });
+              }
+            }
+          }
+          return callback(null, results);
+        }
+
+        // 23. SELECT purchases JOIN lotto numbers JOIN users
+        if (query.includes('FROM purchases p') && query.includes('JOIN lotto_numbers ln') && query.includes('JOIN users u')) {
+          const userSnapshot = await firestore.collection('users').where('email', '==', args[0]).get();
+          if (userSnapshot.empty) {
+            return callback(null, []);
+          }
+          const userData = userSnapshot.docs[0].data();
+          const purchasesSnapshot = await firestore.collection('purchases').where('user_id', '==', userData.user_id).get();
+          const results = [];
+          for (let doc of purchasesSnapshot.docs) {
+            const pData = doc.data();
+            const lottoDoc = await firestore.collection('lotto_numbers').doc(String(pData.lotto_id)).get();
+            if (lottoDoc.exists) {
+              results.push({
+                purchase_id: pData.purchase_id,
+                purchase_date: pData.purchase_date,
+                status: pData.status,
+                lotto_id: pData.lotto_id,
+                number: lottoDoc.data().number,
+                username: userData.username
+              });
+            }
+          }
+          return callback(null, results);
+        }
+
+        // 24. Select sold lotto numbers not drawn
+        if (query.includes("SELECT lotto_id FROM lotto_numbers WHERE status='sold' AND draw_date IS NULL")) {
+          const snapshot = await firestore.collection('lotto_numbers')
+            .where('status', '==', 'sold').get();
+          const rows = snapshot.docs.map(doc => doc.data()).filter(d => !d.draw_date);
+          return callback(null, rows);
+        }
+
+        // Fallback for unhandled queries
+        console.log("⚠️ UNHANDLED SQL QUERY IN FIREBASE ADAPTER:", query);
+        return callback(null, []);
+      } catch (err) {
+        console.error("🔥 Firebase Adapter Error for Query:", query, err);
+        return callback(err, null);
+      }
+    })();
+  },
+  promise: function () {
+    const parent = this;
+    return {
+      query: (sql, params) => {
+        return new Promise((resolve, reject) => {
+          parent.query(sql, params, (err, result) => {
+            if (err) {
+              reject(err);
+            } else {
+              resolve([result]);
+            }
+          });
+        });
+      }
+    };
+  }
+};
+
+const promisePool = db.promise();
 
 // =============== HELPER FUNCTION - FIXED ===============
 function queryDatabase(sql, params) {
   return new Promise((resolve, reject) => {
     db.query(sql, params, (err, result) => {
       if (err) {
-        reject(err); // ⚠️ แก้จาก resolve เป็น reject
+        reject(err);
       } else {
         resolve({
           error: "",
@@ -91,8 +448,9 @@ app.post("/user/register", async (req, res) => {
     console.log(req.body.name);
     console.log(req.body.password);
     console.log(req.body.wallet);
+    console.log(req.body.role);
 
-    const { name, email, password, wallet } = req.body;
+    const { name, email, password, wallet, role } = req.body;
 
     if (!name || name.length < 3) {
       res.send({
@@ -145,9 +503,10 @@ app.post("/user/register", async (req, res) => {
     //hash pwd
     const hashPassword = bcrypt.hashSync(password, 8);
     //console.log(hasfPassword);
+    const userRole = role || "user";
     sqlStr =
-      "INSERT into users (username, email,password,wallet)VALUES(?,?,?,?)";
-    result = await queryDatabase(sqlStr, [name, email, hashPassword, wallet]);
+      "INSERT into users (username, email,password,wallet,role)VALUES(?,?,?,?,?)";
+    result = await queryDatabase(sqlStr, [name, email, hashPassword, wallet, userRole]);
     if (result["error"] != "") {
       console.log(result.error);
 
