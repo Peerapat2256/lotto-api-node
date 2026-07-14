@@ -289,6 +289,13 @@ const db = {
           return callback(null, { affectedRows: 1 });
         }
 
+        // 17b. Update lotto to in_cart
+        if (query.includes("UPDATE lotto_numbers SET status='in_cart' WHERE lotto_id=?")) {
+          const lottoRef = firestore.collection('lotto_numbers').doc(String(args[0]));
+          await lottoRef.update({ status: 'in_cart' });
+          return callback(null, { affectedRows: 1 });
+        }
+
         // 18. Update lotto ticket ownership to Sold
         if (query.includes("UPDATE lotto_numbers SET status = 'sold', user_id = ? WHERE lotto_id = ?")) {
           const lottoRef = firestore.collection('lotto_numbers').doc(String(args[1]));
@@ -1211,153 +1218,166 @@ app.get("/api/purchases/:user_id", authencationToken, async (req, res) => {
   console.log("===== GET PURCHASE HISTORY END =====");
 });
 
-/////////////////////CREATE PURCHASE (เลือกหวย) - FIXED
+/////////////////////CREATE PURCHASE (เลือกหวย) - FIXED FOR FIREBASE
 app.post("/api/purchases", authencationToken, async (req, res) => {
-  const connection = await promisePool.getConnection();
   try {
     const { lotto_id } = req.body;
     if (!lotto_id) {
       return res.status(400).json({ success: false, message: "Missing lotto_id" });
     }
 
-    await connection.beginTransaction();
-
-    const [u] = await connection.query("SELECT user_id FROM users WHERE email=?", [req.user.id]);
-    if (u.length === 0) {
-      await connection.rollback();
+    // Get user_id from email
+    const [u] = await promisePool.query("SELECT user_id FROM users WHERE email=?", [req.user.id]);
+    if (!u || u.length === 0) {
       return res.status(401).json({ success: false, message: "Unauthorized user" });
     }
-    const user_id = u[0].user_id;
+    const user_id = u[0] ? u[0].user_id : u.user_id;
 
-    const [lrows] = await connection.query(
-      "SELECT lotto_id FROM lotto_numbers WHERE lotto_id=? AND status='available' FOR UPDATE",
+    // Check lotto availability
+    const [lrows] = await promisePool.query(
+      "SELECT lotto_id FROM lotto_numbers WHERE lotto_id=? AND status='available'",
       [lotto_id]
     );
-    if (lrows.length === 0) {
-      await connection.rollback();
+    if (!lrows || (Array.isArray(lrows) && lrows.length === 0)) {
       return res.status(400).json({ success: false, message: "หวยนี้ถูกเลือก/ขายไปแล้ว" });
     }
 
-    await connection.query("UPDATE lotto_numbers SET status='in_cart' WHERE lotto_id=?", [lotto_id]);
+    // Update lotto status to in_cart
+    await promisePool.query("UPDATE lotto_numbers SET status='in_cart' WHERE lotto_id=?", [lotto_id]);
 
-    const [pres] = await connection.query(
+    // Create purchase record
+    const [pres] = await promisePool.query(
       "INSERT INTO purchases (user_id, lotto_id, status, purchase_date) VALUES (?, ?, 'pending', NOW())",
       [user_id, lotto_id]
     );
 
-    await connection.commit();
-    return res.json({ success: true, data: { purchase_id: pres.insertId } });
+    return res.json({ success: true, data: { purchase_id: pres.insertId || 0 } });
 
   } catch (err) {
-    try { await connection.rollback(); } catch (_) {}
-    console.error("POST /api/purchases error:", {
-      code: err.code, errno: err.errno, sqlState: err.sqlState, message: err.message
-    });
+    console.error("POST /api/purchases error:", err);
     return res.status(500).json({ success: false, message: err.message });
-  } finally {
-    connection.release(); // ⚠️ สำคัญมาก! ต้อง release connection
   }
 });
 
-///////////////////GET CART (เฉพาะ pending)
+
+///////////////////GET CART (เฉพาะ pending) - FIXED FOR FIREBASE
 app.get("/api/cart", authencationToken, async (req, res) => {
   try {
-    const [rows] = await promisePool.query(
-      `SELECT p.purchase_id, l.lotto_id, l.number, l.price, l.draw_date
-       FROM purchases p
-       JOIN lotto_numbers l ON p.lotto_id = l.lotto_id
-       JOIN users u ON p.user_id = u.user_id
-       WHERE u.email=? AND p.status='pending' AND l.status='in_cart'
-       ORDER BY p.purchase_date DESC`,
-      [req.user.id]
-    );
+    // Get user
+    const userSnapshot = await firestore.collection('users').where('email', '==', req.user.id).get();
+    if (userSnapshot.empty) {
+      return res.json({ success: true, data: [] });
+    }
+    const user_id = userSnapshot.docs[0].data().user_id;
+
+    // Get pending purchases
+    const purchasesSnapshot = await firestore.collection('purchases')
+      .where('user_id', '==', user_id)
+      .where('status', '==', 'pending')
+      .get();
+
+    const rows = [];
+    for (const pDoc of purchasesSnapshot.docs) {
+      const pData = pDoc.data();
+      const lottoDoc = await firestore.collection('lotto_numbers').doc(String(pData.lotto_id)).get();
+      if (lottoDoc.exists && lottoDoc.data().status === 'in_cart') {
+        const lData = lottoDoc.data();
+        rows.push({
+          purchase_id: pData.purchase_id,
+          lotto_id: lData.lotto_id,
+          number: lData.number,
+          price: lData.price || 80,
+          draw_date: lData.draw_date
+        });
+      }
+    }
+
     res.json({ success: true, data: rows });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 });
 
-////////// CANCEL PURCHASE - FIXED
+////////// CANCEL PURCHASE - FIXED FOR FIREBASE
 app.patch("/api/purchases/:id/cancel", authencationToken, async (req, res) => {
-  const connection = await promisePool.getConnection();
   try {
     const pid = Number(req.params.id) || 0;
     if (!pid) return res.status(400).json({ success: false, message: "Missing purchase_id" });
 
-    await connection.beginTransaction();
-
-    const [u] = await connection.query("SELECT user_id FROM users WHERE email=?", [req.user.id]);
-    if (u.length === 0) { 
-      await connection.rollback(); 
-      return res.status(401).json({ success:false, message:"Unauthorized" }); 
+    // Get user_id
+    const userSnapshot = await firestore.collection('users').where('email', '==', req.user.id).get();
+    if (userSnapshot.empty) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
     }
-    const user_id = u[0].user_id;
+    const user_id = userSnapshot.docs[0].data().user_id;
 
-    const [prows] = await connection.query(
-      `SELECT p.purchase_id, p.user_id, p.lotto_id, p.status
-       FROM purchases p
-       WHERE p.purchase_id=? AND p.user_id=? FOR UPDATE`,
-      [pid, user_id]
-    );
-    if (prows.length === 0) { 
-      await connection.rollback(); 
-      return res.status(404).json({ success:false, message:"ไม่พบรายการของคุณ" }); 
+    // Find purchase
+    const purchaseDoc = await firestore.collection('purchases').doc(String(pid)).get();
+    if (!purchaseDoc.exists || purchaseDoc.data().user_id !== user_id) {
+      return res.status(404).json({ success: false, message: "ไม่พบรายการของคุณ" });
     }
-    if (prows[0].status !== 'pending') { 
-      await connection.rollback(); 
-      return res.status(400).json({ success:false, message:"ยกเลิกได้เฉพาะ pending" }); 
+    if (purchaseDoc.data().status !== 'pending') {
+      return res.status(400).json({ success: false, message: "ยกเลิกได้เฉพาะ pending" });
     }
 
-    await connection.query("UPDATE purchases SET status='cancelled' WHERE purchase_id=?", [pid]);
-    await connection.query("UPDATE lotto_numbers SET status='available' WHERE lotto_id=?", [prows[0].lotto_id]);
+    const lotto_id = purchaseDoc.data().lotto_id;
 
-    await connection.commit();
+    // Update purchase status to cancelled
+    await firestore.collection('purchases').doc(String(pid)).update({ status: 'cancelled' });
+    // Update lotto back to available
+    await firestore.collection('lotto_numbers').doc(String(lotto_id)).update({ status: 'available' });
+
     res.json({ success: true, message: "ยกเลิกสำเร็จ" });
   } catch (err) {
-    try { await connection.rollback(); } catch {}
+    console.error("CANCEL error:", err);
     res.status(500).json({ success: false, message: err.message });
-  } finally {
-    connection.release(); // ⚠️ สำคัญมาก!
   }
 });
 
-// CHECKOUT - FIXED
+// CHECKOUT - FIXED FOR FIREBASE
 app.post("/api/checkout", authencationToken, async (req, res) => {
-  const connection = await promisePool.getConnection();
   try {
-    await connection.beginTransaction();
-
-    const [urows] = await connection.query(
-      "SELECT user_id, wallet FROM users WHERE email=? FOR UPDATE",
-      [req.user.id]
-    );
-    if (urows.length === 0) {
-      await connection.rollback();
+    // Get user
+    const userSnapshot = await firestore.collection('users').where('email', '==', req.user.id).get();
+    if (userSnapshot.empty) {
       return res.status(401).json({ success: false, message: "Unauthorized" });
     }
-    const user_id = urows[0].user_id;
-    const walletBefore = Number(urows[0].wallet ?? 0);
+    const userDoc = userSnapshot.docs[0];
+    const userData = userDoc.data();
+    const user_id = userData.user_id;
+    const walletBefore = Number(userData.wallet ?? 0);
 
-    const [cart] = await connection.query(
-      `SELECT p.purchase_id, p.lotto_id, l.price
-       FROM purchases p
-       JOIN lotto_numbers l ON p.lotto_id = l.lotto_id
-       WHERE p.user_id=? AND p.status='pending' AND l.status='in_cart'
-       FOR UPDATE`,
-      [user_id]
-    );
+    // Get pending purchases for this user
+    const purchasesSnapshot = await firestore.collection('purchases')
+      .where('user_id', '==', user_id)
+      .where('status', '==', 'pending')
+      .get();
 
-    if (cart.length === 0) {
-      await connection.rollback();
+    if (purchasesSnapshot.empty) {
       return res.status(400).json({ success: false, message: "ไม่มีรายการในตะกร้า" });
     }
 
-    const purchaseIds = cart.map(r => r.purchase_id);
-    const lottoIds = cart.map(r => r.lotto_id);
-    const total = cart.reduce((sum, r) => sum + Number(r.price ?? 0), 0);
+    // Build cart with lotto prices
+    const cart = [];
+    for (const pDoc of purchasesSnapshot.docs) {
+      const pData = pDoc.data();
+      const lottoDoc = await firestore.collection('lotto_numbers').doc(String(pData.lotto_id)).get();
+      if (lottoDoc.exists && lottoDoc.data().status === 'in_cart') {
+        cart.push({
+          purchase_id: pData.purchase_id,
+          lotto_id: pData.lotto_id,
+          price: Number(lottoDoc.data().price || 80)
+        });
+      }
+    }
+
+    if (cart.length === 0) {
+      return res.status(400).json({ success: false, message: "ไม่มีรายการในตะกร้า" });
+    }
+
+    const total = cart.reduce((sum, r) => sum + r.price, 0);
 
     if (walletBefore < total) {
-      await connection.rollback();
       return res.status(400).json({
         success: false,
         message: "ยอดเงินไม่พอ",
@@ -1366,70 +1386,41 @@ app.post("/api/checkout", authencationToken, async (req, res) => {
       });
     }
 
-    const [lrows] = await connection.query(
-      `SELECT lotto_id FROM lotto_numbers 
-       WHERE lotto_id IN (${lottoIds.map(() => '?').join(',')}) 
-         AND status='in_cart' FOR UPDATE`,
-      lottoIds
-    );
-    if (lrows.length !== lottoIds.length) {
-      await connection.rollback();
-      return res.status(409).json({
-        success: false,
-        message: "บางรายการไม่อยู่ในตะกร้าแล้ว กรุณารีเฟรชตะกร้า"
-      });
+    // Update all purchases to 'purchased' and lottos to 'sold'
+    const batch = firestore.batch();
+    for (const item of cart) {
+      batch.update(firestore.collection('purchases').doc(String(item.purchase_id)), { status: 'purchased' });
+      batch.update(firestore.collection('lotto_numbers').doc(String(item.lotto_id)), { status: 'sold', user_id: user_id });
     }
-
-    await connection.query(
-      `UPDATE purchases 
-         SET status='purchased' 
-       WHERE purchase_id IN (${purchaseIds.map(() => '?').join(',')}) 
-         AND status='pending'`,
-      purchaseIds
-    );
-    await connection.query(
-      `UPDATE lotto_numbers 
-         SET status='sold' 
-       WHERE lotto_id IN (${lottoIds.map(() => '?').join(',')}) 
-         AND status='in_cart'`,
-      lottoIds
-    );
-
+    // Deduct wallet
     const walletAfter = walletBefore - total;
-    await connection.query(
-      "UPDATE users SET wallet=? WHERE user_id=?",
-      [walletAfter, user_id]
-    );
+    batch.update(firestore.collection('users').doc(String(user_id)), { wallet: walletAfter });
+    await batch.commit();
 
-    await connection.commit();
     return res.json({
       success: true,
       message: "ชำระเงินสำเร็จ",
-      purchased_count: purchaseIds.length,
+      purchased_count: cart.length,
       total_paid: total,
       wallet_before: walletBefore,
       wallet_after: walletAfter
     });
   } catch (err) {
-    try { await connection.rollback(); } catch {}
     console.error("POST /api/checkout error:", err);
     return res.status(500).json({ success: false, message: err.message });
-  } finally {
-    connection.release(); // ⚠️ สำคัญมาก!
   }
 });
 
 //////////////////////////////keeen//////////////////////////////
 
-// CLAIM PRIZE - FIXED
+// CLAIM PRIZE - FIXED FOR FIREBASE
 app.post("/api/claim-prize", authencationToken, async (req, res) => {
   console.log("===== CLAIM PRIZE START =====");
-  const connection = await promisePool.getConnection();
-  
+
   try {
     const { lotto_id } = req.body;
     const email = req.user.id;
-    
+
     console.log("Email from token:", email);
     console.log("Lotto ID to claim:", lotto_id);
 
@@ -1440,103 +1431,82 @@ app.post("/api/claim-prize", authencationToken, async (req, res) => {
       });
     }
 
-    await connection.beginTransaction();
+    // Get user data
+    const userSnapshot = await firestore.collection('users').where('email', '==', email).get();
+    if (userSnapshot.empty) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+    const userDoc = userSnapshot.docs[0];
+    const userData = userDoc.data();
 
-    // ตรวจสอบว่าผู้ใช้ซื้อหวยนี้จริงหรือไม่
-    const purchaseCheckSql = `
-      SELECT p.purchase_id, p.lotto_id, p.status, u.user_id, u.wallet, u.email
-      FROM purchases p
-      JOIN users u ON p.user_id = u.user_id
-      WHERE u.email = ? AND p.lotto_id = ? AND p.status = 'purchased'
-      FOR UPDATE
-    `;
-    
-    const [purchaseRows] = await connection.query(purchaseCheckSql, [email, lotto_id]);
+    // Check purchase exists
+    const purchasesSnapshot = await firestore.collection('purchases')
+      .where('user_id', '==', userData.user_id)
+      .where('lotto_id', '==', Number(lotto_id))
+      .where('status', '==', 'purchased')
+      .get();
 
-    if (purchaseRows.length === 0) {
-      await connection.rollback();
+    if (purchasesSnapshot.empty) {
       return res.status(404).json({
         success: false,
         message: "ไม่พบการซื้อหวยนี้หรือยังไม่ได้ชำระเงิน"
       });
     }
 
-    const purchase = purchaseRows[0];
-    console.log("Purchase found:", purchase);
+    const purchaseData = purchasesSnapshot.docs[0].data();
+    console.log("Purchase found:", purchaseData);
 
-    // ตรวจสอบว่าเคยขึ้นเงินแล้วหรือยัง
-    const [lottoStatus] = await connection.query(
-      "SELECT status FROM lotto_numbers WHERE lotto_id = ?",
-      [lotto_id]
-    );
-
-    if (lottoStatus[0]?.status === 'cashed') {
-      await connection.rollback();
+    // Check if already cashed
+    const lottoDoc = await firestore.collection('lotto_numbers').doc(String(lotto_id)).get();
+    if (lottoDoc.exists && lottoDoc.data().status === 'cashed') {
       return res.status(400).json({
         success: false,
         message: "เคยขึ้นเงินรางวัลนี้แล้ว"
       });
     }
 
-    // ดึงรางวัลทั้งหมดที่ถูกของหวยใบนี้
-    const winningSql = `
-      SELECT wn.id, wn.prize_rank, wn.prize_amount, ln.number
-      FROM winning_numbers wn
-      JOIN lotto_numbers ln ON wn.lotto_id = ln.lotto_id
-      WHERE wn.lotto_id = ?
-      ORDER BY wn.prize_rank ASC
-    `;
-    
-    const [winningRows] = await connection.query(winningSql, [lotto_id]);
+    // Get winning numbers for this lotto
+    const winningsSnapshot = await firestore.collection('winning_numbers')
+      .where('lotto_id', '==', Number(lotto_id))
+      .get();
 
-    if (winningRows.length === 0) {
-      await connection.rollback();
+    if (winningsSnapshot.empty) {
       return res.status(400).json({
         success: false,
         message: "หวยใบนี้ไม่ได้ถูกรางวัล"
       });
     }
 
-    // คำนวณเงินรางวัลรวมทั้งหมด
+    // Calculate total prize
     let totalPrizeAmount = 0;
     const prizeDetails = [];
-    
-    for (const winning of winningRows) {
-      const prizeAmount = parseFloat(winning.prize_amount);
+    for (const doc of winningsSnapshot.docs) {
+      const winData = doc.data();
+      const prizeAmount = parseFloat(winData.prize_amount);
       totalPrizeAmount += prizeAmount;
       prizeDetails.push({
-        prize_rank: winning.prize_rank,
+        prize_rank: winData.prize_rank,
         prize_amount: prizeAmount
       });
     }
 
-    const currentWallet = parseFloat(purchase.wallet);
+    const currentWallet = parseFloat(userData.wallet);
     const newWallet = currentWallet + totalPrizeAmount;
 
     console.log(`Total prize amount: ${totalPrizeAmount}, Current wallet: ${currentWallet}, New wallet: ${newWallet}`);
-    console.log("Prize details:", prizeDetails);
 
-    // อัปเดตเงินในกระเป๋า
-    await connection.query(
-      "UPDATE users SET wallet = ? WHERE user_id = ?",
-      [newWallet, purchase.user_id]
-    );
+    // Update wallet, lotto status, and purchase cashout_date
+    const batch = firestore.batch();
+    batch.update(firestore.collection('users').doc(String(userData.user_id)), { wallet: newWallet });
+    batch.update(firestore.collection('lotto_numbers').doc(String(lotto_id)), { status: 'cashed' });
+    batch.update(firestore.collection('purchases').doc(String(purchaseData.purchase_id)), {
+      cashout_date: new Date().toISOString()
+    });
+    await batch.commit();
 
-    // อัปเดต lotto_numbers status เป็น 'cashed'
-    await connection.query(
-      "UPDATE lotto_numbers SET status = 'cashed' WHERE lotto_id = ?",
-      [lotto_id]
-    );
+    console.log("Prize claimed successfully");
 
-    // อัปเดต purchases เพิ่ม cashout_date
-    await connection.query(
-      "UPDATE purchases SET cashout_date = NOW() WHERE purchase_id = ?",
-      [purchase.purchase_id]
-    );
-
-    await connection.commit();
-    
-    console.log("Multiple prizes claimed successfully");
+    const lottoNumber = lottoDoc.exists ? lottoDoc.data().number : "";
 
     res.json({
       success: true,
@@ -1546,22 +1516,19 @@ app.post("/api/claim-prize", authencationToken, async (req, res) => {
         wallet_before: currentWallet,
         wallet_after: newWallet,
         prizes: prizeDetails,
-        lotto_number: winningRows[0].number,
-        prizes_count: winningRows.length
+        lotto_number: lottoNumber,
+        prizes_count: prizeDetails.length
       }
     });
 
   } catch (err) {
-    try { await connection.rollback(); } catch {}
     console.error("Error in claim prize:", err);
     res.status(500).json({
       success: false,
       message: "เกิดข้อผิดพลาดในการขึ้นเงินรางวัล"
     });
-  } finally {
-    connection.release(); // ⚠️ สำคัญมาก!
   }
-  
+
   console.log("===== CLAIM PRIZE END =====");
 });
 
