@@ -1145,71 +1145,90 @@ app.get("/lotto", async (req, res) => {
   }
 });
 
-// ---------------- GET PURCHASE HISTORY ----------------
+// ---------------- GET PURCHASE HISTORY - FIXED FOR FIREBASE ----------------
 app.get("/api/purchases/:user_id", authencationToken, async (req, res) => {
   console.log("===== GET PURCHASE HISTORY START =====");
 
-  const tokenUserId = req.user.id;
+  const tokenEmail = req.user.id;
   const paramUserId = parseInt(req.params.user_id, 10);
 
   if (isNaN(paramUserId)) {
     return res.status(400).json({ success: false, message: "Invalid user_id parameter" });
   }
 
-  if (tokenUserId !== req.user.id) {
-    return res.status(403).json({ success: false, message: "Forbidden: user_id mismatch" });
-  }
-
   try {
-    const sql = `
-      SELECT 
-        p.purchase_id,
-        p.user_id,
-        p.lotto_id,
-        l.number AS lotto_number,
-        l.price AS lotto_price,
-        l.draw_date,
-        l.status AS lotto_status,
-        p.purchase_date,
-        p.status AS purchase_status,
-        p.cashout_date,
-        w.prize_rank,
-        w.prize_amount
-      FROM purchases p
-      JOIN lotto_numbers l ON p.lotto_id = l.lotto_id
-      JOIN users u ON p.user_id = u.user_id
-      LEFT JOIN winning_numbers w ON l.lotto_id = w.lotto_id
-      WHERE u.email = ?
-      AND  p.status = 'purchased'
-      ORDER BY p.purchase_date DESC, w.prize_rank ASC;
-    `;
+    // Get user by email from token
+    const userSnapshot = await firestore.collection('users').where('email', '==', tokenEmail).get();
+    if (userSnapshot.empty) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+    const userData = userSnapshot.docs[0].data();
 
-    const [rows] = await db.promise().query(sql, [tokenUserId]);
+    // Get purchased tickets for this user
+    const purchasesSnapshot = await firestore.collection('purchases')
+      .where('user_id', '==', userData.user_id)
+      .where('status', '==', 'purchased')
+      .get();
+
+    if (purchasesSnapshot.empty) {
+      return res.json({ success: true, purchases: [] });
+    }
 
     const purchasesMap = new Map();
 
-    for (const row of rows) {
-      const lottoId = row.lotto_id;
-      if (!purchasesMap.has(lottoId)) {
-        purchasesMap.set(lottoId, {
-          ...row,
-          prizes: [],
+    for (const pDoc of purchasesSnapshot.docs) {
+      const pData = pDoc.data();
+      const lottoId = pData.lotto_id;
+
+      // Get lotto details
+      const lottoDoc = await firestore.collection('lotto_numbers').doc(String(lottoId)).get();
+      const lottoData = lottoDoc.exists ? lottoDoc.data() : {};
+
+      // Get winning numbers for this lotto
+      const winningsSnapshot = await firestore.collection('winning_numbers')
+        .where('lotto_id', '==', lottoId)
+        .get();
+
+      const prizes = [];
+      for (const wDoc of winningsSnapshot.docs) {
+        const wData = wDoc.data();
+        prizes.push({
+          prize_rank: wData.prize_rank,
+          prize_amount: wData.prize_amount,
+          lotto_status: lottoData.status || null,
         });
       }
 
-      if (row.prize_rank) {
-        purchasesMap.get(lottoId).prizes.push({
-          prize_rank: row.prize_rank,
-          prize_amount: row.prize_amount,
-          lotto_status: row.lotto_status,
-        });
-      }
+      // Sort prizes by rank
+      prizes.sort((a, b) => (a.prize_rank || 0) - (b.prize_rank || 0));
+
+      purchasesMap.set(lottoId, {
+        purchase_id: pData.purchase_id,
+        user_id: pData.user_id,
+        lotto_id: lottoId,
+        lotto_number: lottoData.number || null,
+        lotto_price: lottoData.price || 80,
+        draw_date: lottoData.draw_date || null,
+        lotto_status: lottoData.status || null,
+        purchase_date: pData.purchase_date || null,
+        purchase_status: pData.status,
+        cashout_date: pData.cashout_date || null,
+        prize_rank: prizes.length > 0 ? prizes[0].prize_rank : null,
+        prize_amount: prizes.length > 0 ? prizes[0].prize_amount : null,
+        prizes: prizes,
+      });
     }
 
     const groupedPurchases = Array.from(purchasesMap.values());
+    // Sort by purchase_date desc
+    groupedPurchases.sort((a, b) => {
+      const dateA = a.purchase_date ? new Date(a.purchase_date) : new Date(0);
+      const dateB = b.purchase_date ? new Date(b.purchase_date) : new Date(0);
+      return dateB - dateA;
+    });
 
     res.json({ success: true, purchases: groupedPurchases });
-    console.log("Response sent successfully.");
+    console.log("Response sent successfully. Purchases count:", groupedPurchases.length);
   } catch (err) {
     console.error("Error fetching purchase history:", err);
     res.status(500).json({ success: false, message: "เกิดข้อผิดพลาดในการดึงข้อมูลประวัติ" });
