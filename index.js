@@ -764,7 +764,7 @@ app.post("/lotto/prize", async (req, res) => {
         if (lottoDrawDate === targetDate) {
           results.push({
             number: lottoData.number,
-            prize_amount: winData.prize_amount,
+            prize_amount: winData.prize_amount.toString(),
             prize_rank: winData.prize_rank,
             lotto_id: winData.lotto_id
           });
@@ -876,7 +876,7 @@ app.post("/lotto/checkprize", async (req, res) => {
       const wData = wDoc.data();
       winningData.push({
         number: userLotto.number,
-        prize_amount: wData.prize_amount,
+        prize_amount: wData.prize_amount.toString(),
         prize_rank: wData.prize_rank,
         lotto_id: wData.lotto_id
       });
