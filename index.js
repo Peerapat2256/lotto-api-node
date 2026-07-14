@@ -1067,65 +1067,85 @@ function queryDatabaseStrict(sql, params) {
 app.post("/lotto/save", async (req, res) => {
   console.log("body received:", req.body);
   const { draw_date, prizes } = req.body;
-  console.log("วันที่: " + draw_date.toString());
 
   if (!prizes || Object.keys(prizes).length === 0) {
     return res.send({ status: "error", message: "ข้อมูลรางวัลไม่ครบ" });
   }
 
   try {
-    await queryDatabaseStrict("START TRANSACTION");
+    // Fetch all lotto numbers from Firestore to do the matching
+    const lottoSnapshot = await firestore.collection('lotto_numbers').get();
+    const allLottos = lottoSnapshot.docs.map(doc => doc.data());
+
+    const batch = firestore.batch();
+    const lottoIdsToUpdate = new Set();
+    const winningRecords = [];
 
     for (const rank of Object.keys(prizes)) {
       const prizeRank = parseInt(rank, 10);
-      const prizeNumber = prizes[rank].number.toString().padStart(6, "0");
-      const prizeAmount = prizes[rank].amount;
+      const prizeNumber = prizes[rank].number.toString();
+      const prizeAmount = Number(prizes[rank].amount);
 
-      const rows = await queryDatabaseStrict(
-        `SELECT lotto_id FROM lotto_numbers 
-         WHERE number = ? OR RIGHT(number,3) = RIGHT(?,3) OR RIGHT(number,2) = RIGHT(?,2)
-         LIMIT 1`,
-        [prizeNumber, prizeNumber, prizeNumber]
-      );
-
-      if (rows.length === 0) {
-        await queryDatabaseStrict("ROLLBACK").catch(() => {});
-        return res.send({
-          status: "error",
-          message: `เลข ${prizeNumber} ไม่พบในระบบ`,
-        });
+      // Find matching lottos
+      let matches = [];
+      if (prizeRank === 1 || prizeRank === 2 || prizeRank === 3) {
+        matches = allLottos.filter(l => l.number === prizeNumber);
+      } else if (prizeRank === 4 || prizeRank === 5) {
+        matches = allLottos.filter(l => l.number && l.number.endsWith(prizeNumber));
       }
 
-      const lottoId = rows[0].lotto_id;
+      if (matches.length === 0) {
+        console.log(`No matching lotto found for prize rank ${prizeRank} (${prizeNumber})`);
+        if (prizeRank <= 3) {
+          return res.send({
+            status: "error",
+            message: `เลข ${prizeNumber} ไม่พบในระบบ`,
+          });
+        }
+      }
 
-      await queryDatabaseStrict(
-        "UPDATE lotto_numbers SET draw_date = ? WHERE lotto_id = ?",
-        [draw_date, lottoId]
-      );
-
-      const existingPrize = await queryDatabaseStrict(
-        "SELECT id FROM winning_numbers WHERE lotto_id = ? AND prize_rank = ?",
-        [lottoId, prizeRank]
-      );
-
-      if (existingPrize.length === 0) {
-        await queryDatabaseStrict(
-          `INSERT INTO winning_numbers (lotto_id, prize_rank, prize_amount)
-           VALUES (?, ?, ?)`,
-          [lottoId, prizeRank, prizeAmount]
-        );
-      } else {
-        await queryDatabaseStrict(
-          "UPDATE winning_numbers SET prize_amount = ? WHERE lotto_id = ? AND prize_rank = ?",
-          [prizeAmount, lottoId, prizeRank]
-        );
+      for (const lotto of matches) {
+        lottoIdsToUpdate.add(lotto.lotto_id);
+        winningRecords.push({
+          lotto_id: lotto.lotto_id,
+          prize_rank: prizeRank,
+          prize_amount: prizeAmount
+        });
       }
     }
 
-    await queryDatabaseStrict("COMMIT");
+    // Update draw_date on matching lottos
+    for (const lottoId of lottoIdsToUpdate) {
+      batch.update(firestore.collection('lotto_numbers').doc(String(lottoId)), { draw_date });
+    }
+
+    // Save winning numbers
+    for (const rec of winningRecords) {
+      const winQuery = await firestore.collection('winning_numbers')
+        .where('lotto_id', '==', rec.lotto_id)
+        .where('prize_rank', '==', rec.prize_rank)
+        .get();
+
+      if (winQuery.empty) {
+        const nextWinId = await getNextId('winning_numbers');
+        batch.set(firestore.collection('winning_numbers').doc(String(nextWinId)), {
+          id: nextWinId,
+          lotto_id: rec.lotto_id,
+          prize_rank: rec.prize_rank,
+          prize_amount: rec.prize_amount
+        });
+      } else {
+        const existingDocId = winQuery.docs[0].id;
+        batch.update(firestore.collection('winning_numbers').doc(existingDocId), {
+          prize_amount: rec.prize_amount
+        });
+      }
+    }
+
+    await batch.commit();
     res.send({ status: "success", message: "บันทึกผลรางวัลเรียบร้อย" });
   } catch (error) {
-    await queryDatabaseStrict("ROLLBACK").catch(() => {});
+    console.error("Save lotto error:", error);
     res.send({ status: "error", message: error.message });
   }
 });
